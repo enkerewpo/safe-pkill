@@ -1,0 +1,97 @@
+#!/usr/bin/env bash
+# spkill — pkill -f / pgrep -f that never matches (and kills) its own caller.
+#
+# The trap: when you run `ssh host 'pkill -f my_job'` (or anything wrapped in `sh -c '...'`),
+# the wrapper shell's own command line contains "my_job" too. pkill -f matches it and kills
+# your own session (ssh exits 255, the rest of the command never runs); pgrep -f reports the
+# wrapper as "still running". spkill excludes itself, every ancestor, and its own children.
+#
+# Usage:
+#   spkill [options] <pattern>                          pattern: extended regex on the full command line
+#   ssh host 'bash -s' -- [options] <pattern> < spkill  nothing to install on the remote host
+#
+# Options:
+#   -n, --dry-run     list what would be signalled, send nothing
+#   -l, --list        same as -n (use instead of pgrep -af)
+#   -s, --signal SIG  TERM (default), INT, HUP, USR1, USR2, QUIT
+#   -w, --wait SEC    wait up to SEC seconds for the processes to exit (default 5, 0 = don't wait)
+#   -u, --user USER   only match processes owned by USER
+#   --kill-9          allow SIGKILL (refused by default: SIGKILL on a process inside a GPU/device
+#                     driver call can leave an unkillable D-state zombie holding the device)
+#   -q, --quiet       no process listing
+#
+# Exit status: 0 matched (and all exited, if signalled); 1 no match; 2 usage error;
+#              3 still alive after --wait.
+#
+# https://github.com/enkerewpo/safe-pkill  (MIT)
+set -uo pipefail
+
+SIG=TERM; DRY=0; WAIT=5; ONLY_USER=""; ALLOW9=0; QUIET=0; PAT=""
+usage() { sed -n '2,26p' "${BASH_SOURCE[0]:-$0}" 2>/dev/null | sed 's/^# \{0,1\}//'; }
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -n|--dry-run|-l|--list) DRY=1 ;;
+    -s|--signal) SIG=${2:-}; shift ;;
+    -w|--wait) WAIT=${2:-}; shift ;;
+    -u|--user) ONLY_USER=${2:-}; shift ;;
+    --kill-9) ALLOW9=1 ;;
+    -q|--quiet) QUIET=1 ;;
+    -h|--help) usage; exit 0 ;;
+    --) shift; PAT=${1:-}; break ;;
+    -*) echo "spkill: unknown option $1" >&2; exit 2 ;;
+    *) PAT=$1 ;;
+  esac
+  shift
+done
+[ -n "$PAT" ] || { echo "spkill: missing pattern (see -h)" >&2; exit 2; }
+SIG=${SIG#SIG}; SIG=$(printf '%s' "$SIG" | tr '[:lower:]' '[:upper:]')
+case "$SIG" in
+  TERM|INT|HUP|USR1|USR2|QUIT) ;;
+  KILL|9) [ "$ALLOW9" = 1 ] || { echo "spkill: SIGKILL refused by default; add --kill-9 once you are sure the target is not inside a GPU/device driver call" >&2; exit 2; }; SIG=KILL ;;
+  *) echo "spkill: unsupported signal $SIG" >&2; exit 2 ;;
+esac
+
+ME=$$
+TABLE=$(ps -A -o pid= -o ppid= -o user= -o args= 2>/dev/null) || { echo "spkill: ps failed" >&2; exit 2; }
+
+# Process table -> drop self, the ancestor chain and our own descendants (ps, awk); match the rest
+MATCH=$(printf '%s\n' "$TABLE" | SPK_PAT="$PAT" SPK_USER="$ONLY_USER" awk -v me="$ME" '
+  { pid=$1; pp[pid]=$2; usr[pid]=$3; line[pid]=$0
+    a=$0; sub(/^[ \t]*[0-9]+[ \t]+[0-9]+[ \t]+[^ \t]+[ \t]+/, "", a); args[pid]=a }
+  END {
+    pat=ENVIRON["SPK_PAT"]; user=ENVIRON["SPK_USER"]
+    ex[me]=1; p=me; n=0
+    while ((p in pp) && p!=0 && n<500) { p=pp[p]; ex[p]=1; n++ }
+    for (q in pp) { c=q; d=0
+      while ((c in pp) && c!=0 && c!=1 && d<500) { if (pp[c]==me) { ex[q]=1; break }; c=pp[c]; d++ } }
+    for (q in pp) {
+      if (q in ex) continue
+      if (user!="" && usr[q]!=user) continue
+      if (args[q] ~ pat) printf "%s\t%s\t%s\n", q, usr[q], args[q]
+    }
+  }')
+
+if [ -z "$MATCH" ]; then
+  [ "$QUIET" = 1 ] || echo "spkill: no process matches '$PAT' (self and ancestors excluded)"
+  exit 1
+fi
+PIDS=$(printf '%s\n' "$MATCH" | cut -f1)
+if [ "$QUIET" = 0 ]; then
+  printf '%s\n' "$MATCH" | awk -F'\t' '{ printf "  %-7s %-10s %s\n", $1, $2, substr($3,1,160) }'
+fi
+[ "$DRY" = 1 ] && exit 0
+
+for p in $PIDS; do kill -s "$SIG" "$p" 2>/dev/null || echo "spkill: could not send SIG$SIG to $p (permission denied or already gone)" >&2; done
+[ "$QUIET" = 1 ] || echo "spkill: sent SIG$SIG to $(echo $PIDS | wc -w | tr -d ' ') process(es)"
+
+[ "$WAIT" = 0 ] && exit 0
+end=$(( $(date +%s) + WAIT ))
+while :; do
+  alive=""
+  for p in $PIDS; do kill -0 "$p" 2>/dev/null && alive="$alive $p"; done
+  [ -z "$alive" ] && { [ "$QUIET" = 1 ] || echo "spkill: all exited"; exit 0; }
+  [ "$(date +%s)" -ge "$end" ] && break
+  sleep 0.5
+done
+echo "spkill: still alive after ${WAIT}s:$alive" >&2
+exit 3
