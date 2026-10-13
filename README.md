@@ -20,10 +20,10 @@ On Linux (procps-ng), `pkill -f PATTERN` matches the full command line of **ever
 ## Install
 
 ```bash
-npx skills add enkerewpo/safe-pkill
+npx skills add enkerewpo/safe-pkill -g     # global: ~/.claude/skills/safe-pkill (paths below assume this)
 ```
 
-Or copy `skills/safe-pkill/` into `~/.claude/skills/`.
+Without `-g` it goes into the project (`.agents/skills/safe-pkill`); adjust the paths accordingly. Or copy `skills/safe-pkill/` into `~/.claude/skills/`.
 
 ## Use
 
